@@ -234,8 +234,13 @@ def ensure_local_runtime(config: dict, force: bool = False) -> "object | None":
         mdir.mkdir(parents=True, exist_ok=True)
         preset_path = _generate_presets(mdir, runtimes_root() / "presets.ini")
 
+        idle_unload_s = section.get("idle_unload_seconds")
+        if idle_unload_s is not None:
+            idle_unload_s = int(idle_unload_s)
+
         sup = LlamaServerSupervisor(install_dir, mdir, preset_path=preset_path,
-                                    models_max=int(section.get("models_max", 4)),
+                                    models_max=int(section.get("models_max", 1)),
+                                    idle_unload_s=idle_unload_s,
                                     port=int(section.get("port", 0)) or None)
         try:
             sup.start()
@@ -268,17 +273,45 @@ def get_supervisor():
 
 
 def _start_idle_sweeper(sup) -> None:
-    """Idle-residency loop: every couple of minutes, unload models idle past the supervisor's
-    threshold. Daemon thread tied to the supervisor's lifetime — exits when the server stops."""
+    """Event-friendly idle-residency loop:
+    When no models are loaded, sleeps quietly without polling.
+    When a model is loaded, sleeps until the idle threshold expires, then cleanly unloads.
+    Zero busy-polling when idle."""
     import threading
 
     def _loop():
         while sup.proc is not None and sup.proc.poll() is None:
-            time.sleep(120)
+            # Check model residency without polling metrics/slots if nothing is loaded
             try:
-                sup.sweep_idle()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("idle sweep skipped: %s", exc)
+                models_dict = sup.models()
+                resident = [m for m, s in models_dict.items() if s in ("loaded", "ready")]
+            except Exception:
+                resident = []
+
+            if not resident:
+                # Nothing loaded: sleep quietly, no need to touch the router
+                time.sleep(30)
+                continue
+
+            # A model is loaded. Check if it's idle.
+            # If idle, sleep for the remaining duration until idle_unload_s expires.
+            now = time.monotonic()
+            unloaded = sup.sweep_idle(now=now)
+            if unloaded:
+                # Just unloaded, sleep quietly
+                time.sleep(30)
+                continue
+
+            # If still resident, calculate earliest expiration time to sleep directly
+            min_remaining = sup.idle_unload_s
+            for m in resident:
+                first_idle = sup._idle_since.get(m)
+                if first_idle is not None:
+                    rem = sup.idle_unload_s - (now - first_idle)
+                    if rem < min_remaining:
+                        min_remaining = max(5, rem)
+
+            time.sleep(min_remaining)
 
     threading.Thread(target=_loop, daemon=True, name="local-runtime-idle-sweep").start()
 

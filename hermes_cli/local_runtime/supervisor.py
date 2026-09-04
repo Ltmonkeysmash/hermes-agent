@@ -95,18 +95,18 @@ class LlamaServerSupervisor:
 
     # A model that has gone quiet gets its VRAM back after this long. A constant, not a knob:
     # long enough that an active conversation never trips it, short enough that a wandered-off
-    # session frees ~20 GiB within the hour. No exemptions: demand reloads anything the user
-    # comes back to.
     IDLE_UNLOAD_S = 15 * 60
 
     def __init__(self, install_dir: Path, models_dir: Path, *,
                  models_max: int = 4, port: int | None = None,
+                 idle_unload_s: int | None = None,
                  extra_args: list[str] | None = None,
                  log_path: Path | None = None,
                  preset_path: Path | None = None):
         self.install_dir = Path(install_dir)
         self.models_dir = Path(models_dir)
         self.models_max = models_max
+        self.idle_unload_s = idle_unload_s if idle_unload_s is not None else self.IDLE_UNLOAD_S
         self.port = port or _stable_port()
         self.api_key = _stable_api_key()
         self.extra_args = list(extra_args or [])
@@ -328,7 +328,7 @@ class LlamaServerSupervisor:
                 self._idle_since.pop(model_id, None)
                 continue
             first_idle = self._idle_since.setdefault(model_id, now)
-            if now - first_idle < self.IDLE_UNLOAD_S:
+            if now - first_idle < self.idle_unload_s:
                 continue
             try:
                 self.unload_model(model_id)
