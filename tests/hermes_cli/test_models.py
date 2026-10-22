@@ -84,6 +84,95 @@ class TestFetchOpenRouterModels:
         # Image-only model advertised supported_parameters WITHOUT tools → must be dropped.
         assert "google/gemini-3-pro-image-preview" not in ids
 
+    def test_surfaces_live_free_models_missing_from_the_curated_manifest(self, monkeypatch):
+        """A free model the curated manifest does not list must still reach the picker.
+
+        The manifest is a published snapshot that lags OpenRouter's live catalog, so the
+        picker used to show only the models it happened to list — every free model
+        OpenRouter shipped in the meantime stayed invisible until a release added it by
+        hand. Free models cost nothing, so the live catalog decides which ones exist.
+        """
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"data":['
+                    # free, tool-capable, ABSENT from the manifest → must be surfaced
+                    b'{"id":"recursive/flint-v1.0:free","pricing":{"prompt":"0","completion":"0"},'
+                    b'"supported_parameters":["tools","temperature"]},'
+                    # free, tool-capable, already curated → listed once, keeps its badge
+                    b'{"id":"poolside/laguna-s-2.1:free","pricing":{"prompt":"0","completion":"0"},'
+                    b'"supported_parameters":["tools"]},'
+                    # free but NOT tool-capable → dropped (fails at the first tool call)
+                    b'{"id":"google/lyria-3-pro-preview","pricing":{"prompt":"0","completion":"0"},'
+                    b'"supported_parameters":["response_format"]},'
+                    # paid and absent from the manifest → stays hidden
+                    b'{"id":"paid/new-paid-model","pricing":{"prompt":"0.000003","completion":"0.000015"},'
+                    b'"supported_parameters":["tools"]},'
+                    # the router pseudo-model → never selectable
+                    b'{"id":"openrouter/free","pricing":{"prompt":"0","completion":"0"},'
+                    b'"supported_parameters":["tools"]}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(
+            _models_mod,
+            "OPENROUTER_MODELS",
+            [("poolside/laguna-s-2.1:free", "")],
+        )
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models",
+                  return_value=[("poolside/laguna-s-2.1:free", "")]),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
+        ):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        ids = [mid for mid, _ in models]
+        assert "recursive/flint-v1.0:free" in ids
+        assert ids.count("poolside/laguna-s-2.1:free") == 1
+        assert "google/lyria-3-pro-preview" not in ids
+        assert "paid/new-paid-model" not in ids
+        assert "openrouter/free" not in ids
+        # The newly surfaced free model is tagged free so the picker labels it honestly.
+        assert dict(models)["recursive/flint-v1.0:free"] == "free"
+
+    def test_free_model_missing_a_price_field_is_not_treated_as_free(self, monkeypatch):
+        """A missing price field is UNKNOWN pricing, not free pricing.
+
+        Reading an absent price as 0 would mark paid models free and put them in the
+        picker as free — the user would select one and OpenRouter would bill them.
+        """
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"data":['
+                    b'{"id":"paid/missing-completion-price","pricing":{"prompt":"0"},'
+                    b'"supported_parameters":["tools"]}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(_models_mod, "OPENROUTER_MODELS", [])
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=[]),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
+        ):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        assert "paid/missing-completion-price" not in [mid for mid, _ in models]
+
 
 class TestOpenRouterToolSupportHelper:
     """Unit tests for _openrouter_model_supports_tools (Kilo port #9068)."""

@@ -601,6 +601,55 @@ def _openrouter_model_supports_tools(item: Any) -> bool:
     return "tools" in params if isinstance(params, list) else True
 
 
+# OpenRouter's own dispatch entry ("Free Models Router"). It is a router pseudo-model, not a
+# model the user can select, so it never belongs in the picker.
+_OPENROUTER_NON_MODEL_IDS = frozenset({"openrouter/free"})
+
+
+def _openrouter_entry_is_free(item: Any) -> bool:
+    """True when a live catalog entry costs nothing on BOTH axes.
+
+    Both price fields must be PRESENT and zero. A missing field is UNKNOWN pricing, not free
+    pricing — reading it as 0 would mark paid models free.
+    """
+    pricing = item.get("pricing") if isinstance(item, dict) else None
+    if not isinstance(pricing, dict):
+        return False
+    try:
+        return float(pricing["prompt"]) == 0 and float(pricing["completion"]) == 0
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _openrouter_live_free_ids(live_items: list) -> list[str]:
+    """Free-tier model ids in the LIVE OpenRouter catalog, in catalog order.
+
+    The curated manifest is a published snapshot and it lags OpenRouter's own catalog, so a
+    free model OpenRouter ships today is simply absent from it. The picker is built from the
+    manifest, so every newly-shipped free model stays invisible until a release adds it by
+    hand — the "the free ones never show up" symptom. Free models cost the user nothing, so
+    for them the LIVE catalog is authoritative about which ones exist.
+
+    Tool support is still required: hermes-agent is tool-calling-first and a model without it
+    fails at the first tool call. ``_openrouter_model_supports_tools`` is permissive when the
+    field is absent or malformed, which is what lets a brand-new free variant that OpenRouter
+    has not annotated yet through.
+    """
+    ids: list[str] = []
+    for item in live_items:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "").strip()
+        if not mid or mid in _OPENROUTER_NON_MODEL_IDS:
+            continue
+        if not (_openrouter_entry_is_free(item) or mid.endswith(":free")):
+            continue
+        if not _openrouter_model_supports_tools(item):
+            continue
+        ids.append(mid)
+    return ids
+
+
 # Reasoning-capability cache slots, one set per catalog (OpenRouter, Nous Portal). The logic
 # lives in models_reasoning_caps and reads/writes these by name so tests can reset them here.
 # ``*_cache``: model id → parsed caps for the process lifetime; ``*_failed_at``: monotonic time
@@ -714,6 +763,17 @@ def fetch_openrouter_models(
         else:
             desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
         curated.append((preferred_id, desc))
+
+    # Free-tier models the curated manifest does not carry yet. They cost nothing, so the
+    # live catalog decides which ones exist — without this the picker only ever shows the
+    # models the published manifest happens to list, and every free model OpenRouter ships
+    # in the meantime stays invisible until a release adds it by hand.
+    seen_ids = {mid for mid, _ in curated}
+    for mid in _openrouter_live_free_ids(live_items):
+        if mid in seen_ids:
+            continue
+        seen_ids.add(mid)
+        curated.append((mid, "default" if mid == silent_default else "free"))
 
     if not curated:
         return list(cached or fallback)
